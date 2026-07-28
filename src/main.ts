@@ -74,6 +74,9 @@ interface PublishToolsSettings {
   
   timelineUseSimpleTimelineMonths: boolean;
   timelineMonthOverridesYaml: string;
+  
+  // Website repo sync
+  trpgRepoPath: string;        // e.g. "e:/git/trpg"
 }
 
 const DEFAULT_SETTINGS: PublishToolsSettings = {
@@ -99,6 +102,8 @@ const DEFAULT_SETTINGS: PublishToolsSettings = {
   
   timelineUseSimpleTimelineMonths: true,
   timelineMonthOverridesYaml: "",
+  
+  trpgRepoPath: "",
 };
 
 function normalizeCssSizeValue(raw: string, fallback: string): string {
@@ -199,6 +204,10 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
   
   private loadedCanvasFonts = new Set<string>();
   
+  // Auto-publish debounce
+  private autoPublishTimer: ReturnType<typeof setTimeout> | null = null;
+  private autoPublishPending = false;
+
   /**
    * Public interface for TTRPG Tools – Controls.
    *
@@ -242,6 +251,23 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
       name: "Maps: prepare publish (runtime + data notes + assets)",
       callback: () => void this.prepareAll(),
     });
+
+    // ── Auto-publish: watch for .markers.json file changes ──
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        if (file instanceof TFile && file.path.endsWith(".markers.json")) {
+          this.debouncedAutoPublish(file.path);
+        }
+      }),
+    );
+    // Also watch for new files
+    this.registerEvent(
+      this.app.vault.on("create", (file) => {
+        if (file instanceof TFile && file.path.endsWith(".markers.json")) {
+          this.debouncedAutoPublish(file.path);
+        }
+      }),
+    );
 	
     this.addCommand({
       id: "timeline-publish-generate-data-notes",
@@ -268,6 +294,14 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     });
 
     this.addSettingTab(new PublishToolsSettingTab(this.app, this));
+
+    // ── Initial auto-publish on plugin load ──
+    // Fire after a 5s delay so vault is fully ready; catches markers created before this update
+    setTimeout(() => {
+      if (this.settings.trpgRepoPath) {
+        void this.autoPublishAndSync("(plugin startup)", true);
+      }
+    }, 5000);
   }
 
   async loadSettings(): Promise<void> {
@@ -514,6 +548,133 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     await this.generateTimelineDataNotes();
     await this.generateTimelineAssetsManifest();
     new Notice("Ttrpg tools: publish: maps + timeline done.", 15000);
+  }
+
+  // ── Auto-publish when .markers.json changes ──
+  private debouncedAutoPublish(markersPath: string): void {
+    // Clear existing timer to debounce
+    if (this.autoPublishTimer) {
+      clearTimeout(this.autoPublishTimer);
+    }
+    // Wait 2 seconds after last change before auto-publishing
+    this.autoPublishTimer = setTimeout(() => {
+      void this.autoPublishAndSync(markersPath);
+    }, 2000);
+  }
+
+  private async autoPublishAndSync(markersPath: string, silent = false): Promise<void> {
+    try {
+      console.log(
+        `[TTRPG-Tools-Publish] Auto-publish triggered by: ${markersPath}`,
+      );
+
+      // Step 1: Generate publish data notes (library + markers)
+      await this.generatePublishDataNotes();
+
+      // Step 2: Generate assets manifest
+      await this.generateAssetsManifest();
+
+      // Step 3: Sync to trpg website repo (zoom-map-data)
+      await this.syncToTrpgRepo();
+
+      if (!silent) {
+        new Notice(
+          `TTRPG Tools: Auto-published markers from ${markersPath}. Ready for dg publish.`,
+          5000,
+        );
+      }
+    } catch (e: any) {
+      console.error("[TTRPG-Tools-Publish] Auto-publish failed:", e);
+      new Notice(
+        `TTRPG Tools: Auto-publish failed: ${e.message || String(e)}`,
+        8000,
+      );
+    }
+  }
+
+  /**
+   * Sync publish data to the trpg website repo's zoom-map-data directory.
+   * This ensures the Eleventy build can discover new markers and SVGs.
+   */
+  private async syncToTrpgRepo(): Promise<void> {
+    const repoPath = this.settings.trpgRepoPath;
+    if (!repoPath) {
+      return;
+    }
+
+    // Use Node.js fs/path (available in Electron renderer via esbuild external)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fs = require("fs") as typeof import("node:fs");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const path = require("path") as typeof import("node:path");
+
+    const zoomMapData = path.join(repoPath, "zoom-map-data");
+    if (!fs.existsSync(zoomMapData)) {
+      console.warn(
+        `[TTRPG-Tools-Publish] trpg repo zoom-map-data not found at: ${zoomMapData}`,
+      );
+      return;
+    }
+
+    // The publish data folder (e.g. "ZoomMap/publish")
+    const pubRoot = this.publishRoot();
+    const publishMarkersDir = normalizePath(path.join(pubRoot, "markers").replace(/\\/g, "/"));
+    const targetMarkersDir = path.join(zoomMapData, "markers");
+
+    if (!fs.existsSync(targetMarkersDir)) {
+      fs.mkdirSync(targetMarkersDir, { recursive: true });
+    }
+
+    // --- Sync markers: copy from ZoomMap/publish/markers/ to zoom-map-data/markers/ ---
+    try {
+      const markerFiles = this.app.vault
+        .getFiles()
+        .filter(
+          (f) =>
+            f.path.startsWith(publishMarkersDir) && f.extension === "md",
+        );
+
+      for (const file of markerFiles) {
+        const content = await this.app.vault.read(file);
+        const targetPath = path.join(targetMarkersDir, file.name);
+        fs.writeFileSync(targetPath, content, "utf-8");
+      }
+      console.log(
+        `[TTRPG-Tools-Publish] Synced ${markerFiles.length} marker notes to zoom-map-data/markers/`,
+      );
+    } catch (e: any) {
+      console.error("[TTRPG-Tools-Publish] sync markers error:", e);
+    }
+
+    // --- Sync SVGs: copy linked SVG files from vault to zoom-map-data/ ---
+    try {
+      const maps = await this.scanZoommaps();
+
+      for (const m of maps) {
+        for (const assetPath of m.assetPaths) {
+          const vaultFile = this.app.vault.getFileByPath(
+            normalizePath(assetPath),
+          );
+          if (!vaultFile) {
+            console.debug(
+              `[TTRPG-Tools-Publish] SVG not found: ${assetPath}`,
+            );
+            continue;
+          }
+          // Target: zoom-map-data/<assetPath> (e.g. zoom-map-data/TRPG规则/xxx/excalidraw.svg)
+          const dest = path.join(zoomMapData, assetPath.replace(/\//g, path.sep));
+          const destDir = path.dirname(dest);
+          if (!fs.existsSync(destDir)) {
+            fs.mkdirSync(destDir, { recursive: true });
+          }
+          const svgData = await this.app.vault.readBinary(vaultFile);
+          fs.writeFileSync(dest, Buffer.from(svgData));
+        }
+      }
+      console.log("[TTRPG-Tools-Publish] Synced SVGs to zoom-map-data/");
+    } catch (e: any) {
+      console.error("[TTRPG-Tools-Publish] sync SVGs error:", e);
+    }
   }
   
   private textLayerRasterRoot(): string {
@@ -2632,6 +2793,20 @@ class PublishToolsSettingTab extends PluginSettingTab {
         t.setValue(this.plugin.settings.hideNavFolders ?? "");
         t.onChange(async (v) => {
           this.plugin.settings.hideNavFolders = v ?? "";
+          await this.plugin.saveSettings();
+        });
+      });
+    
+    new Setting(containerEl).setName("Auto-sync").setHeading();
+
+    new Setting(containerEl)
+      .setName("Website repo path (trpg)")
+      .setDesc("Absolute path to the trpg website Git repo (e.g. e:/git/trpg). When set, markers and SVGs are automatically synced to zoom-map-data/ after every .markers.json change.")
+      .addText((t) => {
+        t.setPlaceholder("e:/git/trpg");
+        t.setValue(this.plugin.settings.trpgRepoPath ?? "");
+        t.onChange(async (v) => {
+          this.plugin.settings.trpgRepoPath = (v ?? "").trim();
           await this.plugin.saveSettings();
         });
       });
