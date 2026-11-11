@@ -661,8 +661,14 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
             );
             continue;
           }
-          // Target: zoom-map-data/<assetPath> (e.g. zoom-map-data/TRPG规则/xxx/excalidraw.svg)
-          const dest = path.join(zoomMapData, assetPath.replace(/\//g, path.sep));
+          // Target: zoom-map-data/assets/excalidraw/<assetPath> - the
+          // directory eleventy passthrough-copies to the site root, so the
+          // renderer's fetch of /<assetPath> actually resolves. The old
+          // zoom-map-data/<assetPath> location was never served.
+          const dest = path.join(
+            zoomMapData, "assets", "excalidraw",
+            assetPath.replace(/\//g, path.sep),
+          );
           const destDir = path.dirname(dest);
           if (!fs.existsSync(destDir)) {
             fs.mkdirSync(destDir, { recursive: true });
@@ -670,10 +676,65 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
           const svgData = await this.app.vault.readBinary(vaultFile);
           fs.writeFileSync(dest, Buffer.from(svgData));
         }
+
+        // Also copy the map's markers.json - the renderer fetches it, and
+        // without this step marker edits (moved pins etc.) never reached
+        // the site even though the SVG did.
+        const markersVaultFile = this.app.vault.getFileByPath(
+          normalizePath(m.markersPath),
+        );
+        if (markersVaultFile) {
+          const mDest = path.join(
+            zoomMapData, "assets", "excalidraw",
+            m.markersPath.replace(/\//g, path.sep),
+          );
+          fs.mkdirSync(path.dirname(mDest), { recursive: true });
+          const mData = await this.app.vault.readBinary(markersVaultFile);
+          fs.writeFileSync(mDest, Buffer.from(mData));
+        }
       }
-      console.log("[TTRPG-Tools-Publish] Synced SVGs to zoom-map-data/");
+      console.log("[TTRPG-Tools-Publish] Synced SVGs + markers.json to zoom-map-data/assets/excalidraw/");
     } catch (e: any) {
       console.error("[TTRPG-Tools-Publish] sync SVGs error:", e);
+    }
+
+    // --- Deploy: commit + push the synced data to the website repo ---
+    this.launchSiteDeploy(repoPath);
+  }
+
+  /**
+   * Fire scripts/deploy-zoommap.js in the trpg repo (git add/commit/push of
+   * zoom-map-data) as a detached background process, so Obsidian never blocks
+   * and a downed proxy can't produce errors inside the app. The script logs
+   * to .cache/deploy-zoommap.log and retries failed pushes on later triggers.
+   */
+  private launchSiteDeploy(repoPath: string): void {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { spawn } = require("child_process") as typeof import("node:child_process");
+      const deployScript = path.join(repoPath, "scripts", "deploy-zoommap.js");
+      if (!fs.existsSync(deployScript)) {
+        console.warn(
+          `[TTRPG-Tools-Publish] deploy script not found: ${deployScript}`,
+        );
+        return;
+      }
+      const cacheDir = path.join(repoPath, ".cache");
+      if (!fs.existsSync(cacheDir)) {
+        fs.mkdirSync(cacheDir, { recursive: true });
+      }
+      const logFd = fs.openSync(
+        path.join(cacheDir, "deploy-zoommap.log"), "a",
+      );
+      const child = spawn("node", [deployScript], {
+        cwd: repoPath,
+        detached: true,
+        stdio: ["ignore", logFd, logFd],
+      });
+      child.unref();
+      console.log("[TTRPG-Tools-Publish] Site deploy launched in background.");
+    } catch (e: any) {
+      console.error("[TTRPG-Tools-Publish] failed to launch site deploy:", e);
     }
   }
   
